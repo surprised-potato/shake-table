@@ -1,0 +1,4 @@
+# Firmware build outputs (rebuild from firmware/led_serial.c)
+*.elf
+*.hex
+*.o

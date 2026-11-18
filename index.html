@@ -1457,64 +1457,104 @@
     }
   }
 
-  async function readLoop() {
+  // Connection lifecycle. The rule: whatever happens, the page closes the
+  // port it opened, so the next Connect never finds it "already open".
+  let keepReading = false;
+  let readDone = null;      // promise that settles when readLoop has fully cleaned up
+  let busy = false;         // a connect or disconnect is in progress
+
+  // Read until the user disconnects or the board goes away. Line noise such as
+  // the glitch when the board resets on connect (FramingError, BreakError,
+  // BufferOverrunError, ParityError) only breaks the current reader: take a
+  // new one and carry on. Losing the device (NetworkError) ends the loop.
+  async function readLoop(p) {
     const decoder = new TextDecoder();
     let buffer = '';
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, nl).trim();
-          buffer = buffer.slice(nl + 1);
-          if (line) handleLine(line);
+    while (keepReading && p.readable) {
+      reader = p.readable.getReader();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (line) handleLine(line);
+          }
         }
+      } catch (e) {
+        if (e.name === 'NetworkError') keepReading = false;   // unplugged
+        else console.warn('Serial read glitch, continuing:', e.name, e.message);
+        buffer = '';
+      } finally {
+        try { reader.releaseLock(); } catch (e) {}
+        reader = null;
       }
-    } catch (e) {}
-    disconnected();
+    }
+    await closePort(p);
   }
-  function disconnected() {
-    writer = reader = port = null;
+
+  async function closePort(p) {
+    try { writer?.releaseLock(); } catch (e) {}
+    writer = null;
+    try { await p.close(); } catch (e) {}
+    if (port === p) port = null;
     setEnabled(false);
     connectBtn.textContent = 'Connect';
     setStatus('Disconnected');
   }
+
   async function connect() {
     if (!('serial' in navigator)) { setStatus('Web Serial needs Chrome or Edge on desktop.', true); return; }
+    let p;
     try {
-      port = await navigator.serial.requestPort();
-      await port.open({ baudRate: BAUD });
+      p = await navigator.serial.requestPort();
     } catch (e) {
-      port = null;
-      setStatus(e.name === 'NotFoundError' ? 'No port selected'
-        : e.name === 'NetworkError' ? 'Port busy: close Serial Monitor or other apps'
-        : e.message, true);
+      setStatus(e.name === 'NotFoundError' ? 'No port selected' : e.message, true);
       return;
     }
-    writer = port.writable.getWriter();
-    reader = port.readable.getReader();
+    try {
+      await p.open({ baudRate: BAUD });
+    } catch (e) {
+      if (e.name === 'InvalidStateError') {
+        // Opened earlier by this page and never closed (e.g. by an older
+        // version of the app). Try to close it and open again.
+        try { await p.close(); await p.open({ baudRate: BAUD }); }
+        catch (e2) { setStatus('Port stuck open in this tab: reload the page and connect again.', true); return; }
+      } else {
+        setStatus(e.name === 'NetworkError' ? 'Port busy: close other tabs, Serial Monitor or uploads using it' : e.message, true);
+        return;
+      }
+    }
+    port = p;
+    writer = p.writable.getWriter();
+    keepReading = true;
     connectBtn.textContent = 'Disconnect';
     setStatus('Connecting…');   // opening the port resets the board (~1.5 s)
-    readLoop();
+    readDone = readLoop(p);
     setTimeout(() => {
-      if (!port) return;
+      if (port !== p) return;
       Object.values(axes).forEach((a) => send(oscCommand(a)));
       send('?\n');
     }, 2200);
   }
+
   async function disconnect() {
     if (player.state !== 'idle') finishPlayback('Stopped.', true);
-    const p = port, r = reader, w = writer;
-    try { await r?.cancel(); } catch (e) {}
-    try { r?.releaseLock(); } catch (e) {}
-    try { w?.releaseLock(); } catch (e) {}
-    try { await p?.close(); } catch (e) {}
-    disconnected();
+    keepReading = false;
+    try { await reader?.cancel(); } catch (e) {}   // ends readLoop, which closes the port
+    await readDone;
   }
-  connectBtn.addEventListener('click', () => (port ? disconnect() : connect()));
-  navigator.serial?.addEventListener('disconnect', (e) => { if (e.target === port) disconnected(); });
+
+  connectBtn.addEventListener('click', async () => {
+    if (busy) return;                               // ignore double clicks
+    busy = true;
+    try { await (port ? disconnect() : connect()); } finally { busy = false; }
+  });
+  // Unplugged: the read fails with NetworkError and readLoop closes up.
+  navigator.serial?.addEventListener('disconnect', (e) => { if (e.target === port) keepReading = false; });
 
   // ========================================================================
   // Render loop & initial state
